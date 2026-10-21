@@ -134,7 +134,16 @@ def build_system_prompt(semantic_memory: SemanticMemory, task: str) -> str:
     str
         The complete system prompt, with memories appended if available.
     """
-    raise NotImplementedError("TODO: implement build_system_prompt()")
+    if semantic_memory.count() == 0:
+        return SYSTEM_PROMPT
+
+    memories = semantic_memory.retrieve(task, top_k=3)
+    if not memories:
+        return SYSTEM_PROMPT
+
+    memory_block = "\n## Relevant memories\n"
+    memory_block += "".join(f"- {memory}\n" for memory in memories)
+    return SYSTEM_PROMPT + memory_block
 
 
 def parse_llm_response(response_text: str) -> dict[str, Any]:
@@ -184,7 +193,47 @@ def parse_llm_response(response_text: str) -> dict[str, Any]:
     dict
         A structured dict with the keys described above.
     """
-    raise NotImplementedError("TODO: implement parse_llm_response()")
+    result: dict[str, Any] = {}
+
+    thought = ""
+    if "Thought:" in response_text:
+        after_thought = response_text.split("Thought:", 1)[1]
+        for keyword in ("Action:", "FINAL ANSWER:"):
+            if keyword in after_thought:
+                after_thought = after_thought.split(keyword, 1)[0]
+        thought = after_thought.strip()
+    result["thought"] = thought
+
+    if "FINAL ANSWER:" in response_text:
+        result["final_answer"] = response_text.split("FINAL ANSWER:", 1)[1].strip()
+        return result
+
+    action = ""
+    if "Action:" in response_text:
+        after_action = response_text.split("Action:", 1)[1]
+        if "Action Input:" in after_action:
+            after_action = after_action.split("Action Input:", 1)[0]
+        action = after_action.strip().splitlines()[0].strip()
+    result["action"] = action
+
+    action_input_raw = ""
+    if "Action Input:" in response_text:
+        action_input_raw = response_text.split("Action Input:", 1)[1].strip()
+
+    try:
+        action_input = json.loads(action_input_raw)
+    except json.JSONDecodeError as exc:
+        result["parse_error"] = (
+            f"Could not parse Action Input as JSON: {exc}. "
+            f"Raw value was: {action_input_raw!r}"
+        )
+    else:
+        if isinstance(action_input, dict):
+            result["action_input"] = action_input
+        else:
+            result["parse_error"] = "Action Input must be a JSON object."
+
+    return result
 
 
 def run_agent(task: str) -> AgentResult:
@@ -235,7 +284,64 @@ def run_agent(task: str) -> AgentResult:
         Structured result including the final answer, iteration count,
         and a log of all tool calls made.
     """
-    raise NotImplementedError("TODO: implement run_agent()")
+    buffer = SlidingWindowBuffer(max_messages=20)
+    semantic_memory = SemanticMemory()
+
+    buffer.set_system(build_system_prompt(semantic_memory, task))
+    buffer.add("user", task)
+
+    tool_calls_log: list[dict[str, Any]] = []
+
+    for iteration in range(1, MAX_ITERATIONS + 1):
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=buffer.messages(),
+            tools=TOOL_SCHEMAS,
+            tool_choice="none",
+        )
+        assistant_text = response.choices[0].message.content or ""
+        buffer.add("assistant", assistant_text)
+
+        parsed = parse_llm_response(assistant_text)
+
+        if "final_answer" in parsed:
+            final_answer = parsed["final_answer"]
+            semantic_memory.store(f"Task: {task}\nAnswer: {final_answer}")
+            return AgentResult(
+                answer=final_answer,
+                iterations=iteration,
+                tool_calls=tool_calls_log,
+                stopped_early=False,
+            )
+
+        if "parse_error" in parsed:
+            buffer.add(
+                "user",
+                f"OBSERVATION: Parse error – {parsed['parse_error']}",
+            )
+            continue
+
+        action = parsed.get("action", "")
+        action_input = parsed.get("action_input", {})
+        tool_result = dispatch_tool(action, action_input)
+
+        tool_calls_log.append({
+            "tool": action,
+            "args": action_input,
+            "result": tool_result,
+        })
+
+        if not tool_result.startswith("ERROR"):
+            semantic_memory.store(f"Tool {action} result: {tool_result[:200]}")
+
+        buffer.add("user", f"OBSERVATION: {tool_result}")
+
+    return AgentResult(
+        answer="MAX_ITERATIONS reached without a FINAL ANSWER.",
+        iterations=MAX_ITERATIONS,
+        tool_calls=tool_calls_log,
+        stopped_early=True,
+    )
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
